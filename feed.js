@@ -1,285 +1,193 @@
-const fs = require("fs");
-const steem = require('steem');
-const request = require("request");
+"use strict";
 
-var config = JSON.parse(fs.readFileSync("config.json"));
+const steem = require("steem");
 
-// Connect to the specified RPC node
-var rpc_node = config.rpc_nodes ? config.rpc_nodes[0] : (config.rpc_node ? config.rpc_node : 'https://api.steemit.com');
-steem.api.setOptions({ 
-    transport: 'http', 
-    uri: rpc_node, 
-    url: rpc_node 
-});
+const { log } = require("./src/logger");
+const { loadConfig } = require("./src/config-loader");
+const {
+  collectPrices,
+  average,
+  buildExchangeRate,
+} = require("./src/price-feed");
 
-// if feed_steem_active_key is not set in config.json
-// then look for it in environment variables
-function get_active_key() {
-    const key = config.feed_steem_active_key;
-    if (key) return key;
-    return process.env.feed_steem_active_key;
-}
+const DEFAULTS = {
+  interval: 15,
+  feed_publish_fail_retry: 5,
+  price_feed_max_retry: 5,
+  retry_interval: 10,
+  peg_multi: 1,
+  request_timeout: 20000,
+};
 
-// if feed_steem_account is not set in config.json
-// then look for it in environment variables
-function get_account_name() {
-    const key = config.feed_steem_account;
-    if (key) return key;
-    return process.env.feed_steem_account;
-}
+const config = loadConfig();
 
-if (!get_account_name()) {
-    console.log("feed_steem_account not set in config.json or environment");
-    process.exit(1);
-}
-
-if (!get_active_key()) {
-    console.log("feed_steem_active_key not set in config.json or environment");
-    process.exit(1);
-}
-
-if (!config.exchanges || config.exchanges.length == 0) {
-    console.log("no exchanges are specified.");
-    process.exit(1);
-}
-
-function log(msg) { 
-    console.log(new Date().toString() + ' - ' + msg); 
-}
-
-function startProcess() {  
-  let prices = [];
-
-  if (config.exchanges.indexOf('binance') >= 0) {
-    loadPriceBinance(function (price) {
-      prices.push(price);
-    }, 0);
+/**
+ * Resolve a setting from the config file first, then the environment, then a
+ * provided fallback.
+ */
+function getSetting(name, fallback) {
+  if (typeof config[name] !== "undefined" && config[name] !== "") {
+    return config[name];
   }
 
-  if (config.exchanges.indexOf('poloniex') >= 0) {
-    loadPricePoloniex(function (price) {
-      prices.push(price);
-    }, 0);
+  if (typeof process.env[name] !== "undefined" && process.env[name] !== "") {
+    return process.env[name];
   }
-  
-  if (config.exchanges.indexOf('cloudflare') >= 0) {
-    loadPriceCloudflare(function (price) {
-      prices.push(price);
-    }, 0);
-  }  
-  
-  if (config.exchanges.indexOf('bittrex') >= 0) {
-    loadPriceBittrex(function (price) {
-      prices.push(price);
-    }, 0);
-  }   
-  
-  if (config.exchanges.indexOf('coingecko') >= 0) {
-    loadPriceCoingecko(function (price) {
-      prices.push(price);
-    }, 0);
-  }  
-  
-  if (config.exchanges.indexOf('cryptocompare') >= 0) {
-    loadPriceCryptocompare(function (price) {
-      prices.push(price);
-    }, 0);
-  }           
 
-  // Publish the average of all markets that were loaded
-  setTimeout(function() {
-    if (prices.length == 0) {
-      log("no prices found.");
-      return;
-    }   
-    const price = prices.reduce((t, v) => t + v, 0) / prices.length;
-    console.log(prices);
-    log("Price = " + price);
-    publishFeed(price, 0); 
-  }, config.feed_publish_interval * 1000);
+  return fallback;
 }
 
-function publishFeed(price, retries) {
-  const peg_multi = config.peg_multi ? config.peg_multi : 1;
-  const exchange_rate = { 
-    base: price.toFixed(3) + ' SBD', 
-    quote: (1 / peg_multi).toFixed(3) + ' STEEM' 
-  };
+/**
+ * Resolve a positive numeric setting, falling back to the documented default.
+ */
+function getNumber(name) {
+  const value = Number(config[name]);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULTS[name];
+}
 
-  log('Broadcasting feed_publish transaction: ' + JSON.stringify(exchange_rate));
+function getActiveKey() {
+  return getSetting("feed_steem_active_key");
+}
 
-  steem.broadcast.feedPublish(get_active_key(), get_account_name(), exchange_rate, function (err, result) {
-    if (result && !err) {
-      log('Broadcast successful!');
-    } else {
-      log('Error broadcasting feed_publish transaction: ' + err);
+function getAccountName() {
+  return getSetting("feed_steem_account");
+}
 
-      if (retries % config.feed_publish_fail_retry == 0) {
+// ---------------------------------------------------------------------------
+// Startup validation
+// ---------------------------------------------------------------------------
+
+log(__filename);
+log(config.rpc_nodes || []);
+
+if (!Array.isArray(config.rpc_nodes) || config.rpc_nodes.length < 3) {
+  log("Please provide at least three rpc_nodes in config.yaml/config.json");
+  process.exit(1);
+}
+
+if (!getAccountName()) {
+  log("feed_steem_account not set in config.yaml/config.json or environment");
+  process.exit(1);
+}
+
+if (!getActiveKey()) {
+  log(
+    "feed_steem_active_key not set in config.yaml/config.json or environment",
+  );
+  process.exit(1);
+}
+
+if (!Array.isArray(config.exchanges) || config.exchanges.length === 0) {
+  log("No exchanges are specified.");
+  process.exit(1);
+}
+
+const firstNode = config.rpc_nodes[0] || "https://api.steemit.com";
+steem.api.setOptions({ transport: "https", uri: firstNode, url: firstNode });
+
+/**
+ * Switch the active RPC node to the next one in the configured list.
+ */
+function failover() {
+  if (!Array.isArray(config.rpc_nodes) || config.rpc_nodes.length <= 1) {
+    return;
+  }
+
+  let nextIndex = config.rpc_nodes.indexOf(steem.api.options.url) + 1;
+  if (nextIndex >= config.rpc_nodes.length) {
+    nextIndex = 0;
+  }
+
+  const nextNode = config.rpc_nodes[nextIndex];
+  steem.api.setOptions({ transport: "https", uri: nextNode, url: nextNode });
+
+  log("***********************************************");
+  log("Failing over to: " + nextNode);
+  log("***********************************************");
+}
+
+// ---------------------------------------------------------------------------
+// Publishing
+// ---------------------------------------------------------------------------
+
+/**
+ * Broadcast a single `feed_publish` transaction, retrying (and failing over
+ * RPC nodes) on error.
+ *
+ * @param {number} price - The price to publish.
+ * @param {number} [retries=0] - Internal retry counter.
+ */
+function publishFeed(price, retries = 0) {
+  let exchangeRate;
+  try {
+    exchangeRate = buildExchangeRate(price, getNumber("peg_multi"));
+  } catch (err) {
+    log("Refusing to publish: " + err.message);
+    return;
+  }
+
+  log("Broadcasting feed_publish transaction: " + JSON.stringify(exchangeRate));
+
+  steem.broadcast.feedPublish(
+    getActiveKey(),
+    getAccountName(),
+    exchangeRate,
+    function (err, result) {
+      if (result && !err) {
+        log("Broadcast successful!");
+        return;
+      }
+
+      log("Error broadcasting feed_publish transaction: " + err);
+
+      const failRetry = getNumber("feed_publish_fail_retry");
+      if (retries > 0 && retries % failRetry === 0) {
         failover();
       }
 
-      setTimeout(function () { 
-        publishFeed(price, retries + 1);
-      }, config.retry_interval * 1000);
-    }
-  });
+      setTimeout(
+        () => publishFeed(price, retries + 1),
+        getNumber("retry_interval") * 1000,
+      );
+    },
+  );
 }
 
-function loadPriceCryptocompare(callback, retries) {
-  // Load STEEM price in BTC from Cryptocompare and convert that to USD using BTC price
-  request.get('https://min-api.cryptocompare.com/data/price?fsym=STEEM&tsyms=USDT', function (e, r, data) {    
-    try {
-      const steem_price = parseFloat(JSON.parse(data).USDT);
-      log('Loaded STEEM Price from Cryptocompare: ' + steem_price);
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
 
-      if (callback) {
-        callback(steem_price);
-      }
-    } catch (err) {
-      log('Error loading STEEM price from Cryptocompare: ' + err);
-
-      if(retries <= config.price_feed_max_retry) {
-        setTimeout(function () { 
-          loadPriceCryptocompare(callback, retries + 1); 
-        }, config.retry_interval * 1000);
-      }
-    }
+/**
+ * Fetch prices from all configured exchanges, average them, and publish.
+ */
+async function runOnce() {
+  const prices = await collectPrices(config.exchanges, {
+    log,
+    timeout: getNumber("request_timeout"),
+    maxRetries: getNumber("price_feed_max_retry"),
+    retryInterval: getNumber("retry_interval") * 1000,
   });
-}
 
-function loadPriceCoingecko(callback, retries) {
-  // Load STEEM price in BTC from Coingecko and convert that to USD using BTC price
-  request.get('https://api.coingecko.com/api/v3/simple/price?ids=steem&vs_currencies=usd', function (e, r, data) {
-    try {
-      const steem_price = parseFloat(JSON.parse(data).steem.usd);
-      log('Loaded STEEM Price from Coingecko: ' + steem_price);
-
-      if (callback) {
-        callback(steem_price);
-      }
-    } catch (err) {
-      log('Error loading STEEM price from Coingecko: ' + err);
-
-      if(retries <= config.price_feed_max_retry) {
-        setTimeout(function () { 
-          loadPriceCoingecko(callback, retries + 1); 
-        }, config.retry_interval * 1000);
-      }
-    }
-  });
-}
-
-function loadPriceBittrex(callback, retries) {
-  // Load STEEM price in BTC from bittrex and convert that to USD using BTC price
-  request.get('https://api.bittrex.com/v3/markets/BTC-USD/ticker', function (e, r, data) {
-    request.get('https://api.bittrex.com/v3/markets/STEEM-BTC/ticker', function (e, r, btc_data) {
-      try {
-        const steem_price = parseFloat(JSON.parse(data).lastTradeRate) * parseFloat(JSON.parse(btc_data).lastTradeRate);
-        log('Loaded STEEM Price from Bittrex: ' + steem_price);
-
-        if (callback) {
-          callback(steem_price);
-        }
-      } catch (err) {
-        log('Error loading STEEM price from Bittrex: ' + err);
-
-        if(retries <= config.price_feed_max_retry) {
-          setTimeout(function () { 
-            loadPriceBittrex(callback, retries + 1); 
-          }, config.retry_interval * 1000);
-        }
-      }
-    });
-  });
-}
-
-function loadPriceBinance(callback, retries) {
-  // Load STEEM price in BTC and convert that to USD using BTC price
-  request.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', function (e, r, data) {
-    request.get('https://api.binance.com/api/v3/ticker/price?symbol=STEEMBTC', function (e, r, btc_data) {
-      try {
-        const steem_price = parseFloat(JSON.parse(data).price) * parseFloat(JSON.parse(btc_data).price);
-        log('Loaded STEEM Price from Binance: ' + steem_price);
-
-        if (callback) {
-          callback(steem_price);
-        }
-      } catch (err) {
-        log('Error loading STEEM price from Binance: ' + err);
-
-        if (retries <= config.price_feed_max_retry) {
-          setTimeout(function () { 
-            loadPriceBinance(callback, retries + 1); 
-          }, config.retry_interval * 1000);
-        }
-      }
-    });
-  });
-}
-
-function loadPricePoloniex(callback, retries) {
-  // Load STEEM price in BTC and convert that to USD using BTC price
-  request.get('https://poloniex.com/public?command=returnTicker', function (e, r, data) {
-    try {
-      const json_data = JSON.parse(data);
-      const steem_price = parseFloat(json_data['USDT_BTC'].last) * parseFloat(json_data['BTC_STEEM'].last)
-      log('Loaded STEEM Price from Poloniex: ' + steem_price);
-
-      if (callback) {
-        callback(steem_price);
-      }
-    } catch (err) {
-      log('Error loading STEEM price from Poloniex: ' + err);
-
-      if (retries <= config.price_feed_max_retry) {
-        setTimeout(function () { 
-          loadPriceBinance(loadPricePoloniex, retries + 1); 
-        }, config.retry_interval * 1000);
-      }
-    }
-  });
-}
-
-function loadPriceCloudflare(callback, retries) {
-  // Load STEEM price
-  request.get('https://price.justyy.workers.dev/query/?s=STEEM+USDT', function (e, r, data) {
-    try {
-      const json_data = JSON.parse(data);
-      const arr = json_data.result[0].split(' ')
-      const steem_price = parseFloat(arr[3]); 
-      log('Loaded STEEM Price from Cloudflare: ' + steem_price);
-
-      if (callback) {
-        callback(steem_price);
-      }
-    } catch (err) {
-      log('Error loading STEEM price from Cloudflare: ' + err);
-
-      if (retries <= config.price_feed_max_retry) {
-        setTimeout(function () { 
-          loadPriceBinance(loadPriceCloudflare, retries + 1); 
-        }, config.retry_interval * 1000);
-      }
-    }
-  });
-}
-
-function failover() {
-  if (config.rpc_nodes && config.rpc_nodes.length > 1) {
-    let cur_node_index = config.rpc_nodes.indexOf(steem.api.options.url) + 1;
-
-    if (cur_node_index == config.rpc_nodes.length) {
-      cur_node_index = 0;
-    }
-
-    const rpc_node = config.rpc_nodes[cur_node_index];
-
-    steem.api.setOptions({ transport: 'http', uri: rpc_node, url: rpc_node });
-    log('***********************************************');
-    log('Failing over to: ' + rpc_node);
-    log('***********************************************');
+  if (prices.length === 0) {
+    log("No prices found.");
+    return;
   }
+
+  const price = average(prices);
+
+  if (!Number.isFinite(price) || price <= 0) {
+    log("No valid prices found.");
+    return;
+  }
+
+  log("Price candidates: " + JSON.stringify(prices));
+  log("Price = " + price);
+  publishFeed(price, 0);
 }
 
-setInterval(startProcess, config.interval * 60 * 1000);
+function startProcess() {
+  runOnce().catch((err) => log("Unexpected error in price feed run: " + err));
+}
+
+setInterval(startProcess, getNumber("interval") * 60 * 1000);
 startProcess();
