@@ -2,7 +2,7 @@
   "rpc_nodes": [
     "https://api.steemit.com",
     "https://api.justyy.com",
-	"https://api.symbionts.io"
+    "https://api.symbionts.io"
   ],
   "feed_steem_account": "${FEED_STEEM_ACCOUNT:-}",
   "feed_steem_active_key": "${FEED_STEEM_ACTIVE_KEY:-}",
